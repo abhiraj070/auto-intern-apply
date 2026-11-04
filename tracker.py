@@ -72,6 +72,55 @@ def is_target_role(title):
     return any(p.search(title_lower) for p in COMPILED_PATTERNS)
 
 
+def parse_and_filter_stipend(salary_min, salary_max, period, desc, min_stipend=10000):
+    """
+    Filters out explicit unpaid roles or roles below min_stipend (e.g. 10k INR/month).
+    Keeps competitive / undisclosed roles so top companies are not missed.
+    """
+    # 1. Check structured salary data if present
+    if salary_max or salary_min:
+        val = salary_max or salary_min
+        p_up = (period or "").upper()
+        if p_up == "MONTH":
+            if val < min_stipend:
+                return False, f"< 10k ({val}/mo)"
+            return True, f"INR {val:,.0f}/month"
+        elif p_up == "YEAR":
+            if val < (min_stipend * 12):
+                return False, f"< 120k/yr ({val}/yr)"
+            return True, f"INR {val:,.0f}/year"
+        elif p_up == "HOUR":
+            # Rough monthly equivalent: ~160 hrs * hourly rate
+            if (val * 160) < min_stipend:
+                return False, f"< 10k equivalent"
+            return True, f"INR {val:,.0f}/hour"
+        return True, f"{val}"
+
+    # 2. Check description for explicit 'unpaid' indicators
+    desc_lower = desc.lower() if desc else ""
+    unpaid_terms = ["unpaid", "no stipend", "zero stipend", "without stipend", "volunteer intern", "non-paid"]
+    if any(u in desc_lower for u in unpaid_terms):
+        return False, "Unpaid"
+
+    # 3. Check description for explicit low stipend amounts (e.g., 5000, 5k, 7000)
+    low_match = re.search(r"(?:stipend|salary)[^\d\n]{1,25}([1-9]\d{2,3}|[1-9]k)\b", desc_lower)
+    if low_match:
+        st_val = low_match.group(1).replace("k", "000")
+        try:
+            if int(st_val) < min_stipend:
+                return False, f"< 10k ({st_val})"
+        except Exception:
+            pass
+
+    # 4. Check description for positive stipend mentions (e.g., 15k, 20,000, etc.)
+    high_match = re.search(r"(?:stipend|salary)[^\d\n]{1,25}(\d{2,3}[kK]|\d{5,6})\b", desc_lower)
+    if high_match:
+        found_st = high_match.group(1)
+        return True, f"~{found_st}"
+
+    return True, "Competitive / Disclosed on Apply"
+
+
 def fetch_simplify_listings(repo_name):
     url = f"https://raw.githubusercontent.com/SimplifyJobs/{repo_name}/dev/.github/scripts/listings.json"
     req = urllib.request.Request(url, headers={"User-Agent": "InternshipBot/1.0"})
@@ -101,7 +150,8 @@ def fetch_arbeitnow_listings():
                         "url": item.get("url", ""),
                         "locations": [item.get("location", "Remote" if item.get("remote") else "Various")],
                         "active": True,
-                        "source": "Arbeitnow"
+                        "source": "Arbeitnow",
+                        "stipend": "Disclosed on Apply"
                     })
             return jobs
     except Exception as e:
@@ -109,19 +159,19 @@ def fetch_arbeitnow_listings():
         return []
 
 
-def fetch_jsearch_listings(rapidapi_key):
+def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
     """
     Fetches real-time tech internships from Google for Jobs / JSearch
-    Aggregates LinkedIn, Indeed, Glassdoor, Internshala, Naukri, etc.
+    Aggregates LinkedIn, Indeed, Glassdoor, Internshala, Naukri, Wellfound, etc.
     """
     if not rapidapi_key or not rapidapi_key.strip() or rapidapi_key == "YOUR_RAPIDAPI_KEY_HERE":
         return []
 
     queries = [
-        "Software Engineer intern India",
-        "AI Machine Learning intern India",
-        "Fullstack Developer intern India",
-        "Backend Developer intern India"
+        "Software Engineer intern in India",
+        "AI Machine Learning intern in India",
+        "Backend Developer intern in India",
+        "Fullstack Developer intern in India"
     ]
 
     headers = {
@@ -131,16 +181,24 @@ def fetch_jsearch_listings(rapidapi_key):
     }
 
     jobs = []
-    print("[*] Querying RapidAPI JSearch (aggregates LinkedIn, Indeed, Internshala, Glassdoor)...")
+    print("[*] Querying RapidAPI JSearch (indexes LinkedIn, Indeed, Internshala, Naukri, Glassdoor)...")
 
+    # Rotate through queries (fetching 1-2 per daily run to preserve free quota)
     for q in queries[:2]:
         encoded_q = urllib.parse.quote(q)
-        url = f"https://jsearch.p.rapidapi.com/search?query={encoded_q}&page=1&num_pages=1&employment_types=INTERN"
+        url = f"https://jsearch.p.rapidapi.com/search-v2?query={encoded_q}&num_pages=1"
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                for item in data.get("data", []):
+                job_list = []
+                data_field = data.get("data", {})
+                if isinstance(data_field, dict):
+                    job_list = data_field.get("jobs", [])
+                elif isinstance(data_field, list):
+                    job_list = data_field
+
+                for item in job_list:
                     job_id = item.get("job_id", "")
                     title = item.get("job_title", "")
                     company = item.get("employer_name", "Unknown")
@@ -148,7 +206,17 @@ def fetch_jsearch_listings(rapidapi_key):
                     city = item.get("job_city") or ""
                     country = item.get("job_country") or "India"
                     location = f"{city}, {country}".strip(", ") if city else country
-                    publisher = item.get("job_publisher") or "Job Board"
+                    publisher = item.get("job_publisher") or "Web"
+                    desc = item.get("job_description", "")
+
+                    sal_min = item.get("job_min_salary")
+                    sal_max = item.get("job_max_salary")
+                    period = item.get("job_salary_period")
+
+                    # Apply stipend filter (>= 10,000 INR/month or competitive)
+                    passed_stipend, stipend_text = parse_and_filter_stipend(sal_min, sal_max, period, desc, min_stipend)
+                    if not passed_stipend:
+                        continue
 
                     jobs.append({
                         "id": f"jsearch-{job_id}" if job_id else url_link,
@@ -157,20 +225,18 @@ def fetch_jsearch_listings(rapidapi_key):
                         "url": url_link,
                         "locations": [location],
                         "active": True,
-                        "source": f"{publisher} (via JSearch)"
+                        "source": f"{publisher} (via JSearch)",
+                        "stipend": stipend_text
                     })
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
-            if "Endpoint" in err_body or e.code in (403, 404):
-                print(f"[!] JSearch API Note (HTTP {e.code}): Please ensure you clicked 'Subscribe' on the Free Basic plan on RapidAPI's JSearch page.")
-            else:
-                print(f"[!] JSearch API Notice ({e.code}): {err_body[:100]}")
+            print(f"[!] JSearch notice ({e.code}): {err_body[:100]}")
             break
         except Exception as e:
-            print(f"[!] JSearch Exception: {e}")
+            print(f"[!] JSearch exception: {e}")
             break
 
-    print(f"[*] JSearch returned {len(jobs)} postings.")
+    print(f"[*] JSearch returned {len(jobs)} qualifying postings after stipend check.")
     return jobs
 
 
@@ -203,8 +269,10 @@ def send_discord_webhook(webhook_url, embeds):
 def main():
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
+    min_stipend = 10000
+    max_alerts = 15
 
-    # Also check config.json if available
+    # Check config.json if available
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -213,17 +281,22 @@ def main():
                     webhook_url = cfg["discord_webhook_url"]
                 if not rapidapi_key and "rapidapi_key" in cfg:
                     rapidapi_key = cfg["rapidapi_key"]
+                if "min_stipend" in cfg:
+                    min_stipend = int(cfg["min_stipend"])
+                if "max_alerts_per_run" in cfg:
+                    max_alerts = int(cfg["max_alerts_per_run"])
         except Exception:
             pass
 
     seen_ids = load_seen()
     print(f"[*] Loaded {len(seen_ids)} previously seen jobs.")
+    print(f"[*] Configuration: Min Stipend = ₹{min_stipend:,} | Max Daily Alerts = {max_alerts}")
 
     print("[*] Fetching listings from SimplifyJobs (Summer 2025 / Summer 2026)...")
     listings_2025 = fetch_simplify_listings("Summer2025-Internships")
     listings_2026 = fetch_simplify_listings("Summer2026-Internships")
     arbeitnow_jobs = fetch_arbeitnow_listings()
-    jsearch_jobs = fetch_jsearch_listings(rapidapi_key)
+    jsearch_jobs = fetch_jsearch_listings(rapidapi_key, min_stipend=min_stipend)
 
     all_raw = listings_2025 + listings_2026 + arbeitnow_jobs + jsearch_jobs
     print(f"[*] Total raw listings gathered: {len(all_raw)}")
@@ -252,6 +325,7 @@ def main():
         loc_str = ", ".join(locs) if isinstance(locs, list) else str(locs or "Not specified")
         terms = item.get("terms", [])
         term_str = ", ".join(terms) if isinstance(terms, list) else str(terms or "")
+        stipend_str = item.get("stipend", "Disclosed on Apply")
 
         new_matches.append({
             "id": job_id,
@@ -260,7 +334,8 @@ def main():
             "url": url,
             "location": loc_str,
             "term": term_str,
-            "source": item.get("source", "Simplify")
+            "source": item.get("source", "Simplify"),
+            "stipend": stipend_str
         })
 
     print(f"[*] Found {len(new_matches)} new matching internship openings.")
@@ -269,9 +344,13 @@ def main():
         print("[OK] No new postings since last check. All caught up!")
         return
 
+    # Limit to max_alerts_per_run so user isn't spammed
+    alerts_to_send = new_matches[:max_alerts]
+    print(f"[*] Preparing top {len(alerts_to_send)} alerts for Discord...")
+
     # Prepare Discord embeds
     embeds = []
-    for match in new_matches:
+    for match in alerts_to_send:
         # Determine color: purple for AI/ML, green for Fullstack/Backend/SWE
         t_lower = match["title"].lower()
         if any(k in t_lower for k in ["ai", "machine learning", "ml", "deep learning", "nlp", "llm", "genai"]):
@@ -290,6 +369,7 @@ def main():
         fields = [
             {"name": "Company", "value": match["company"], "inline": True},
             {"name": "Location", "value": match["location"] or "Remote/Various", "inline": True},
+            {"name": "Stipend", "value": match["stipend"], "inline": True},
         ]
         if match["term"]:
             fields.append({"name": "Term", "value": match["term"], "inline": True})
@@ -302,7 +382,7 @@ def main():
             "description": f"**Category:** {role_type}\n[**Click Here to Apply Directly**]({match['url']})",
             "color": color,
             "fields": fields,
-            "footer": {"text": "Internship Alert Bot • Automated Update"}
+            "footer": {"text": f"Internship Alert Bot • Min Stipend ₹{min_stipend:,}"}
         }
         embeds.append(embed)
 
@@ -313,13 +393,11 @@ def main():
     else:
         print("[!] No Discord Webhook configured yet (or URL is placeholder).")
         print("[*] Displaying top 5 new matches in console:")
-        for m in new_matches[:5]:
-            print(f"  - [{m['company']}] {m['title']} ({m['location']}) -> {m['url']}")
-        if len(new_matches) > 5:
-            print(f"  ... and {len(new_matches) - 5} more.")
+        for m in alerts_to_send[:5]:
+            print(f"  - [{m['company']}] {m['title']} ({m['location']}) - Stipend: {m['stipend']} -> {m['url']}")
 
-    # Mark as seen
-    for m in new_matches:
+    # Mark sent alerts as seen
+    for m in alerts_to_send:
         seen_ids.add(m["id"])
     save_seen(seen_ids)
     print(f"[*] Updated seen database. Total tracked jobs: {len(seen_ids)}")

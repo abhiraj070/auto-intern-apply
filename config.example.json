@@ -1,4 +1,6 @@
 {
   "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL_HERE",
-  "rapidapi_key": "YOUR_RAPIDAPI_KEY_HERE"
+  "rapidapi_key": "YOUR_RAPIDAPI_KEY_HERE",
+  "min_stipend": 10000,
+  "max_alerts_per_run": 15
 }
