@@ -1,6 +1,7 @@
 """
 Internship Search & Discord Notifier
 Targets: AI Engineering, Machine Learning, Fullstack Development, Backend Development, SWE internships.
+Platforms: SimplifyJobs (ATS direct), Arbeitnow, and RapidAPI JSearch (LinkedIn, Indeed, Internshala, Glassdoor, etc.).
 """
 
 import os
@@ -9,6 +10,7 @@ import json
 import re
 import time
 import urllib.request
+import urllib.parse
 import urllib.error
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -107,6 +109,71 @@ def fetch_arbeitnow_listings():
         return []
 
 
+def fetch_jsearch_listings(rapidapi_key):
+    """
+    Fetches real-time tech internships from Google for Jobs / JSearch
+    Aggregates LinkedIn, Indeed, Glassdoor, Internshala, Naukri, etc.
+    """
+    if not rapidapi_key or not rapidapi_key.strip() or rapidapi_key == "YOUR_RAPIDAPI_KEY_HERE":
+        return []
+
+    queries = [
+        "Software Engineer intern India",
+        "AI Machine Learning intern India",
+        "Fullstack Developer intern India",
+        "Backend Developer intern India"
+    ]
+
+    headers = {
+        "X-RapidAPI-Key": rapidapi_key.strip(),
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    jobs = []
+    print("[*] Querying RapidAPI JSearch (aggregates LinkedIn, Indeed, Internshala, Glassdoor)...")
+
+    for q in queries[:2]:
+        encoded_q = urllib.parse.quote(q)
+        url = f"https://jsearch.p.rapidapi.com/search?query={encoded_q}&page=1&num_pages=1&employment_types=INTERN"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for item in data.get("data", []):
+                    job_id = item.get("job_id", "")
+                    title = item.get("job_title", "")
+                    company = item.get("employer_name", "Unknown")
+                    url_link = item.get("job_apply_link") or item.get("job_google_link") or ""
+                    city = item.get("job_city") or ""
+                    country = item.get("job_country") or "India"
+                    location = f"{city}, {country}".strip(", ") if city else country
+                    publisher = item.get("job_publisher") or "Job Board"
+
+                    jobs.append({
+                        "id": f"jsearch-{job_id}" if job_id else url_link,
+                        "company_name": company,
+                        "title": title,
+                        "url": url_link,
+                        "locations": [location],
+                        "active": True,
+                        "source": f"{publisher} (via JSearch)"
+                    })
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            if "Endpoint" in err_body or e.code in (403, 404):
+                print(f"[!] JSearch API Note (HTTP {e.code}): Please ensure you clicked 'Subscribe' on the Free Basic plan on RapidAPI's JSearch page.")
+            else:
+                print(f"[!] JSearch API Notice ({e.code}): {err_body[:100]}")
+            break
+        except Exception as e:
+            print(f"[!] JSearch Exception: {e}")
+            break
+
+    print(f"[*] JSearch returned {len(jobs)} postings.")
+    return jobs
+
+
 def send_discord_webhook(webhook_url, embeds):
     """Sends embeds to a Discord webhook in chunks of 10."""
     headers = {
@@ -135,6 +202,7 @@ def send_discord_webhook(webhook_url, embeds):
 
 def main():
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
 
     # Also check config.json if available
     if os.path.exists(CONFIG_FILE):
@@ -143,6 +211,8 @@ def main():
                 cfg = json.load(f)
                 if not webhook_url and "discord_webhook_url" in cfg:
                     webhook_url = cfg["discord_webhook_url"]
+                if not rapidapi_key and "rapidapi_key" in cfg:
+                    rapidapi_key = cfg["rapidapi_key"]
         except Exception:
             pass
 
@@ -153,8 +223,9 @@ def main():
     listings_2025 = fetch_simplify_listings("Summer2025-Internships")
     listings_2026 = fetch_simplify_listings("Summer2026-Internships")
     arbeitnow_jobs = fetch_arbeitnow_listings()
+    jsearch_jobs = fetch_jsearch_listings(rapidapi_key)
 
-    all_raw = listings_2025 + listings_2026 + arbeitnow_jobs
+    all_raw = listings_2025 + listings_2026 + arbeitnow_jobs + jsearch_jobs
     print(f"[*] Total raw listings gathered: {len(all_raw)}")
 
     new_matches = []
