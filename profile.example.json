@@ -1,0 +1,64 @@
+{
+  "personal_info": {
+    "first_name": "Firstname",
+    "last_name": "Lastname",
+    "full_name": "Firstname Lastname",
+    "email": "your.email@example.com",
+    "phone": "+91-XXXXXXXXXX",
+    "location": {
+      "city": "Bengaluru",
+      "state": "Karnataka",
+      "country": "India",
+      "postal_code": "560001",
+      "address_line": ""
+    }
+  },
+  "online_presence": {
+    "github": "https://github.com/your-username",
+    "linkedin": "https://www.linkedin.com/in/your-profile",
+    "portfolio": "https://yourportfolio.com",
+    "twitter": ""
+  },
+  "education": {
+    "school": "University Name",
+    "degree": "Bachelor of Technology (B.Tech)",
+    "discipline": "Computer Science and Engineering",
+    "start_year": 2022,
+    "graduation_year": 2026,
+    "gpa": "8.5/10.0"
+  },
+  "documents": {
+    "resume_path": "./resume.pdf",
+    "cover_letter_path": ""
+  },
+  "work_authorization": {
+    "authorized_to_work_in_india": true,
+    "requires_sponsorship": false,
+    "willing_to_relocate": true,
+    "available_start_date": "Immediate",
+    "notice_period_days": 0
+  },
+  "skills": [
+    "Python",
+    "FastAPI",
+    "TypeScript",
+    "React",
+    "Node.js",
+    "Machine Learning",
+    "PyTorch",
+    "PostgreSQL",
+    "Docker",
+    "Git"
+  ],
+  "common_answers": {
+    "why_hire_me": "Brief summary of technical skills and passion for software/AI development.",
+    "preferred_work_type": "Remote or Hybrid",
+    "years_of_experience": "0-1"
+  },
+  "eeo_demographics": {
+    "gender": "Decline to self-identify",
+    "hispanic_or_latino": "No",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not have a disability"
+  }
+}
