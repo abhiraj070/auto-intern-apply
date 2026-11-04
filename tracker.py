@@ -270,7 +270,7 @@ def main():
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     min_stipend = 10000
-    max_alerts = 15
+    max_alerts = 20
 
     # Check config.json if available
     if os.path.exists(CONFIG_FILE):
