@@ -1,0 +1,12 @@
+# Local configuration and credentials
+config.json
+.env
+
+# Cache and temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# State database (optional: uncomment if you don't want to track seen listings)
+seen_jobs.json

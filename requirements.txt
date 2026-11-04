@@ -1,0 +1,4 @@
+# Standard library only (Python 3.7+)
+# Optional libraries for future enhancements:
+# requests>=2.28.0
+# python-dotenv>=1.0.0
