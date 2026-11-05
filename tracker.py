@@ -13,6 +13,14 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+# Ensure clean UTF-8 printing on Windows console
+if sys.platform == "win32":
+    try:
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_jobs.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
@@ -45,6 +53,38 @@ NEGATIVE_KEYWORDS = [
     "sales", "marketing", "recruiter", "hr ", "human resources", 
     "accountant", "finance intern", "legal intern", "hardware", "civil"
 ]
+
+# Location matching: Only allow India OR Remote roles
+INDIA_REGEX = re.compile(
+    r"\b(?:india|bengaluru|bangalore|hyderabad|pune|mumbai|delhi|noida|gurugram|gurgaon|chennai|kolkata|ahmedabad|jaipur|indore|chandigarh|kochi|kerala|telangana|karnataka|maharashtra|haryana|tamil nadu|uttar pradesh)\b",
+    re.IGNORECASE
+)
+REMOTE_REGEX = re.compile(
+    r"\b(?:remote|work from home|wfh|worldwide|anywhere|telecommute)\b",
+    re.IGNORECASE
+)
+
+
+def is_valid_location(loc_str, is_remote=False):
+    """
+    Returns True ONLY if:
+    1. Located inside India, OR
+    2. Explicitly Remote.
+    Rejects physical on-site/hybrid roles in US, Canada, Europe, etc.
+    """
+    if is_remote:
+        return True
+
+    if not loc_str:
+        return False
+
+    if INDIA_REGEX.search(loc_str):
+        return True
+
+    if REMOTE_REGEX.search(loc_str):
+        return True
+
+    return False
 
 
 def load_seen():
@@ -151,7 +191,8 @@ def fetch_arbeitnow_listings():
                         "locations": [item.get("location", "Remote" if item.get("remote") else "Various")],
                         "active": True,
                         "source": "Arbeitnow",
-                        "stipend": "Disclosed on Apply"
+                        "stipend": "Disclosed on Apply",
+                        "is_remote": bool(item.get("remote", False))
                     })
             return jobs
     except Exception as e:
@@ -171,7 +212,8 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
         "Software Engineer intern in India",
         "AI Machine Learning intern in India",
         "Backend Developer intern in India",
-        "Fullstack Developer intern in India"
+        "Fullstack Developer intern in India",
+        "Remote Software Engineer intern"
     ]
 
     headers = {
@@ -183,13 +225,13 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
     jobs = []
     print("[*] Querying RapidAPI JSearch (indexes LinkedIn, Indeed, Internshala, Naukri, Glassdoor)...")
 
-    # Rotate through queries (fetching 1-2 per daily run to preserve free quota)
-    for q in queries[:2]:
+    # Rotate through queries (fetching up to 3 queries per run)
+    for q in queries[:3]:
         encoded_q = urllib.parse.quote(q)
         url = f"https://jsearch.p.rapidapi.com/search-v2?query={encoded_q}&num_pages=1"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 job_list = []
                 data_field = data.get("data", {})
@@ -226,7 +268,8 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
                         "locations": [location],
                         "active": True,
                         "source": f"{publisher} (via JSearch)",
-                        "stipend": stipend_text
+                        "stipend": stipend_text,
+                        "is_remote": bool(item.get("job_is_remote", False))
                     })
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
@@ -270,7 +313,8 @@ def main():
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     min_stipend = 10000
-    max_alerts = 20
+    max_alerts = 30
+    min_indian_alerts = 15
 
     # Check config.json if available
     if os.path.exists(CONFIG_FILE):
@@ -285,12 +329,14 @@ def main():
                     min_stipend = int(cfg["min_stipend"])
                 if "max_alerts_per_run" in cfg:
                     max_alerts = int(cfg["max_alerts_per_run"])
+                if "min_indian_alerts" in cfg:
+                    min_indian_alerts = int(cfg["min_indian_alerts"])
         except Exception:
             pass
 
     seen_ids = load_seen()
     print(f"[*] Loaded {len(seen_ids)} previously seen jobs.")
-    print(f"[*] Configuration: Min Stipend = ₹{min_stipend:,} | Max Daily Alerts = {max_alerts}")
+    print(f"[*] Configuration: Min Stipend = INR {min_stipend:,} | Total Daily Alerts = {max_alerts} (Min {min_indian_alerts} for India)")
 
     print("[*] Fetching listings from SimplifyJobs (Summer 2025 / Summer 2026)...")
     listings_2025 = fetch_simplify_listings("Summer2025-Internships")
@@ -323,9 +369,17 @@ def main():
         url = item.get("url", "")
         locs = item.get("locations", [])
         loc_str = ", ".join(locs) if isinstance(locs, list) else str(locs or "Not specified")
+        is_remote = bool(item.get("is_remote", False)) or ("remote" in loc_str.lower())
+
+        # Location filter: Only accept India OR Remote roles
+        if not is_valid_location(loc_str, is_remote=is_remote):
+            continue
+
         terms = item.get("terms", [])
         term_str = ", ".join(terms) if isinstance(terms, list) else str(terms or "")
         stipend_str = item.get("stipend", "Disclosed on Apply")
+
+        is_india = bool(INDIA_REGEX.search(loc_str))
 
         new_matches.append({
             "id": job_id,
@@ -335,7 +389,8 @@ def main():
             "location": loc_str,
             "term": term_str,
             "source": item.get("source", "Simplify"),
-            "stipend": stipend_str
+            "stipend": stipend_str,
+            "is_india": is_india
         })
 
     print(f"[*] Found {len(new_matches)} new matching internship openings.")
@@ -344,9 +399,32 @@ def main():
         print("[OK] No new postings since last check. All caught up!")
         return
 
-    # Limit to max_alerts_per_run so user isn't spammed
-    alerts_to_send = new_matches[:max_alerts]
-    print(f"[*] Preparing top {len(alerts_to_send)} alerts for Discord...")
+    # Partition matches into India and Remote
+    india_matches = [m for m in new_matches if m["is_india"]]
+    remote_matches = [m for m in new_matches if not m["is_india"]]
+
+    print(f"[*] Pool breakdown: {len(india_matches)} Indian openings, {len(remote_matches)} Remote openings")
+
+    # Select: up to min_indian_alerts (15) strictly for India, fill rest up to max_alerts (30) with Remote
+    selected_india = india_matches[:min_indian_alerts]
+    needed_remote = max_alerts - len(selected_india)
+    selected_remote = remote_matches[:needed_remote]
+
+    alerts_to_send = selected_india + selected_remote
+
+    # Backfill with remaining Indian jobs if room exists
+    if len(alerts_to_send) < max_alerts and len(india_matches) > len(selected_india):
+        extra_india = india_matches[len(selected_india) : len(selected_india) + (max_alerts - len(alerts_to_send))]
+        alerts_to_send.extend(extra_india)
+
+    # Backfill with remaining Remote jobs if room exists
+    if len(alerts_to_send) < max_alerts and len(remote_matches) > len(selected_remote):
+        extra_rem = remote_matches[len(selected_remote) : len(selected_remote) + (max_alerts - len(alerts_to_send))]
+        alerts_to_send.extend(extra_rem)
+
+    india_count = len([m for m in alerts_to_send if m["is_india"]])
+    remote_count = len([m for m in alerts_to_send if not m["is_india"]])
+    print(f"[*] Dispatching {len(alerts_to_send)} total alerts: {india_count} strictly Indian openings + {remote_count} Remote openings.")
 
     # Prepare Discord embeds
     embeds = []
