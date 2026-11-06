@@ -99,7 +99,37 @@ def load_seen():
 
 def save_seen(seen_ids):
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen_ids), f, indent=2)
+        json.dump(sorted(list(seen_ids)), f, indent=2)
+
+
+def get_canonical_keys(company, title, url, job_id=""):
+    """
+    Generates a set of unique fingerprints for foolproof deduplication:
+    1. Clean normalized URL (strips tracking/referral parameters)
+    2. Company + Title normalized signature (catches identical jobs even if URL changes)
+    3. Specific static IDs (e.g. job_uid, ATS UUIDs)
+    """
+    keys = set()
+    if job_id and not str(job_id).startswith("jsearch-LTJ"):
+        keys.add(str(job_id).strip())
+
+    if url:
+        # Strip all marketing, tracking, and referral query parameters
+        clean_url = re.sub(
+            r"[\?&](?:utm_[^&]+|ref=[^&]+|trk=[^&]+|refId=[^&]+|trackingId=[^&]+|midToken=[^&]+|position=[^&]+|pageNum=[^&]+)",
+            "",
+            str(url)
+        ).rstrip("?&/").lower()
+        if clean_url:
+            keys.add(clean_url)
+
+    if company and title:
+        comp_norm = re.sub(r"[^a-z0-9]", "", company.lower())
+        title_norm = re.sub(r"[^a-z0-9]", "", title.lower())
+        if comp_norm and title_norm:
+            keys.add(f"sig:{comp_norm}:{title_norm}")
+
+    return keys
 
 
 def is_target_role(title):
@@ -260,8 +290,11 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
                     if not passed_stipend:
                         continue
 
+                    job_uid = item.get("job_uid") or ""
+                    stable_id = f"jsearch-{job_uid}" if job_uid else url_link
+
                     jobs.append({
-                        "id": f"jsearch-{job_id}" if job_id else url_link,
+                        "id": stable_id,
                         "company_name": company,
                         "title": title,
                         "url": url_link,
@@ -348,25 +381,34 @@ def main():
     print(f"[*] Total raw listings gathered: {len(all_raw)}")
 
     new_matches = []
+    current_run_keys = set()
     
     for item in all_raw:
         job_id = str(item.get("id") or item.get("url") or "")
-        if not job_id:
+        company = item.get("company_name", "Unknown Company")
+        title = item.get("title", "")
+        url = item.get("url", "")
+
+        # Generate unique canonical keys (clean URL, company+title signature, static ID)
+        item_keys = get_canonical_keys(company, title, url, job_id)
+        if not item_keys:
             continue
 
-        if job_id in seen_ids:
+        # Check if already alerted in ANY prior run
+        if any(k in seen_ids for k in item_keys):
+            continue
+
+        # Check if already caught in current run (intra-run deduplication across queries)
+        if any(k in current_run_keys for k in item_keys):
             continue
 
         # Check if active
         if item.get("active") is False:
             continue
 
-        title = item.get("title", "")
         if not is_target_role(title):
             continue
 
-        company = item.get("company_name", "Unknown Company")
-        url = item.get("url", "")
         locs = item.get("locations", [])
         loc_str = ", ".join(locs) if isinstance(locs, list) else str(locs or "Not specified")
         is_remote = bool(item.get("is_remote", False)) or ("remote" in loc_str.lower())
@@ -381,6 +423,9 @@ def main():
 
         is_india = bool(INDIA_REGEX.search(loc_str))
 
+        # Register keys in current run to prevent duplicates within this batch
+        current_run_keys.update(item_keys)
+
         new_matches.append({
             "id": job_id,
             "company": company,
@@ -390,7 +435,8 @@ def main():
             "term": term_str,
             "source": item.get("source", "Simplify"),
             "stipend": stipend_str,
-            "is_india": is_india
+            "is_india": is_india,
+            "keys": item_keys
         })
 
     print(f"[*] Found {len(new_matches)} new matching internship openings.")
@@ -474,11 +520,11 @@ def main():
         for m in alerts_to_send[:5]:
             print(f"  - [{m['company']}] {m['title']} ({m['location']}) - Stipend: {m['stipend']} -> {m['url']}")
 
-    # Mark sent alerts as seen
+    # Mark sent alerts as seen using all canonical fingerprints (URL, signature, ID)
     for m in alerts_to_send:
-        seen_ids.add(m["id"])
+        seen_ids.update(m.get("keys", [m["id"]]))
     save_seen(seen_ids)
-    print(f"[*] Updated seen database. Total tracked jobs: {len(seen_ids)}")
+    print(f"[*] Updated seen database. Total tracked fingerprints: {len(seen_ids)}")
 
 
 if __name__ == "__main__":
