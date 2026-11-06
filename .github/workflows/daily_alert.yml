@@ -2,9 +2,14 @@ name: Daily Tech Internship Alerts
 
 on:
   schedule:
-    # 9:00 AM IST is 3:30 AM UTC (IST is UTC+5:30)
-    - cron: '30 3 * * *'
+    # 9:05 AM IST is 3:35 AM UTC (avoiding :00 and :30 congestion on GitHub Actions)
+    - cron: '35 3 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
 
 permissions:
   contents: write # Needed to persist seen_jobs.json state
