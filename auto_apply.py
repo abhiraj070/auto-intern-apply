@@ -9,10 +9,11 @@ import sys
 import json
 import time
 import argparse
+import re
+from urllib.parse import urlsplit
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -108,6 +109,31 @@ def upload_file(driver, file_path):
     return False
 
 
+def submit_application(driver, selector):
+    """Return True only after a visible receipt confirms submission."""
+    try:
+        if not driver.execute_script("return Array.from(document.forms).every(form => form.checkValidity());"):
+            print("[!] Required answers are missing or invalid; review the form.")
+            return False
+        receipt = re.compile(
+            r"(?:your\s+)?application\s+(?:has been\s+|was\s+)?(?:successfully\s+)?(?:submitted|received)"
+            r"|thank you for applying|thanks for applying", re.IGNORECASE)
+        def confirmed(browser):
+            return bool(receipt.search(browser.find_element(By.TAG_NAME, "body").text))
+
+        # A pre-existing receipt must not be mistaken for a new submission.
+        if confirmed(driver):
+            print("[!] A receipt is already visible; no new submission attempted.")
+            return False
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(selector)).click()
+        WebDriverWait(driver, 20).until(confirmed)
+        print("[OK] Application submission confirmed.")
+        return True
+    except (WebDriverException, TimeoutException) as e:
+        print(f"[!] Submission not confirmed: {e}. Review before retrying.")
+        return False
+
+
 # ==============================================================================
 # Lever Application Handler
 # ==============================================================================
@@ -120,10 +146,10 @@ def apply_lever(driver, profile, resume_path, auto_submit=False):
     time.sleep(2)  # Wait for page elements to settle
 
     # Name
-    fill_input(driver, (By.NAME, "name"), p_info.get("full_name", ""))
+    name_ok = fill_input(driver, (By.NAME, "name"), p_info.get("full_name", ""))
     
     # Email
-    fill_input(driver, (By.NAME, "email"), p_info.get("email", ""))
+    email_ok = fill_input(driver, (By.NAME, "email"), p_info.get("email", ""))
     
     # Phone
     fill_input(driver, (By.NAME, "phone"), p_info.get("phone", ""))
@@ -138,26 +164,18 @@ def apply_lever(driver, profile, resume_path, auto_submit=False):
     fill_input(driver, (By.NAME, "urls[Other]"), links.get("portfolio", ""))
 
     # Resume
-    upload_file(driver, resume_path)
-
-    # Common dropdowns or radiogroups
-    try:
-        # Authorization (Yes)
-        auth_radios = driver.find_elements(By.XPATH, "//input[@type='radio'][contains(translate(@value, 'YES', 'yes'), 'yes')]")
-        for r in auth_radios:
-            if not r.is_selected():
-                driver.execute_script("arguments[0].click();", r)
-    except Exception:
-        pass
+    resume_ok = upload_file(driver, resume_path)
+    # Custom radio questions require their own context. Leave them for review;
+    # the India-specific authorization profile cannot answer foreign eligibility.
+    print("[*] Review custom questions, including work authorization, manually.")
 
     print("[OK] Lever form auto-filled!")
     if auto_submit:
-        try:
-            btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit'], #btn-submit")
-            btn.click()
-            print("[✓] Application submitted on Lever!")
-        except Exception as e:
-            print(f"[!] Could not auto-submit: {e}. Please submit manually.")
+        if not (name_ok and email_ok and resume_ok):
+            print("[!] Contact details or resume were not filled; automatic submission stopped.")
+            return False
+        return submit_application(driver, (By.CSS_SELECTOR, "button[type='submit'], #btn-submit"))
+    return False
 
 
 # ==============================================================================
@@ -172,21 +190,21 @@ def apply_greenhouse(driver, profile, resume_path, auto_submit=False):
     time.sleep(2)
 
     # First & Last Name
-    fill_input(driver, (By.ID, "first_name"), p_info.get("first_name", ""))
-    fill_input(driver, (By.ID, "last_name"), p_info.get("last_name", ""))
+    first_ok = fill_input(driver, (By.ID, "first_name"), p_info.get("first_name", ""))
+    last_ok = fill_input(driver, (By.ID, "last_name"), p_info.get("last_name", ""))
     
     # Fallback to combined name
-    fill_input(driver, (By.NAME, "job_application[name]"), p_info.get("full_name", ""))
+    combined_ok = fill_input(driver, (By.NAME, "job_application[name]"), p_info.get("full_name", ""))
 
     # Email & Phone
-    fill_input(driver, (By.ID, "email"), p_info.get("email", ""))
+    email_ok = fill_input(driver, (By.ID, "email"), p_info.get("email", ""))
     fill_input(driver, (By.ID, "phone"), p_info.get("phone", ""))
 
     # Location
     fill_input(driver, (By.ID, "job_application_location"), f"{p_info.get('location', {}).get('city', '')}, India")
 
     # Resume Upload
-    upload_file(driver, resume_path)
+    resume_ok = upload_file(driver, resume_path)
 
     # LinkedIn / Website / GitHub custom questions
     try:
@@ -208,12 +226,11 @@ def apply_greenhouse(driver, profile, resume_path, auto_submit=False):
 
     print("[OK] Greenhouse form auto-filled!")
     if auto_submit:
-        try:
-            btn = driver.find_element(By.ID, "submit_app")
-            btn.click()
-            print("[✓] Application submitted on Greenhouse!")
-        except Exception as e:
-            print(f"[!] Could not auto-submit: {e}. Please submit manually.")
+        if not ((first_ok and last_ok or combined_ok) and email_ok and resume_ok):
+            print("[!] Contact details or resume were not filled; automatic submission stopped.")
+            return False
+        return submit_application(driver, (By.ID, "submit_app"))
+    return False
 
 
 # ==============================================================================
@@ -248,6 +265,9 @@ def apply_ashby(driver, profile, resume_path, auto_submit=False):
         pass
 
     print("[OK] Ashby form auto-filled!")
+    if auto_submit:
+        print("[!] Ashby automatic submission is unsupported; manual review is required.")
+    return False
 
 
 # ==============================================================================
@@ -286,12 +306,17 @@ def apply_generic(driver, profile, resume_path, auto_submit=False):
 
     upload_file(driver, resume_path)
     print("[OK] Generic form auto-filled!")
+    if auto_submit:
+        print("[!] Generic automatic submission is unsupported; manual review is required.")
+    return False
 
 
 # ==============================================================================
 # Main Runner
 # ==============================================================================
 def apply_to_job(job_url, mode="assist", browser="chrome"):
+    if mode not in {"assist", "auto", "headless"}:
+        raise ValueError("Unknown application mode")
     profile = load_profile()
     resume_rel = profile.get("documents", {}).get("resume_path", "./resume.pdf")
     resume_abs = os.path.abspath(os.path.join(SCRIPT_DIR, resume_rel))
@@ -312,38 +337,49 @@ def apply_to_job(job_url, mode="assist", browser="chrome"):
         time.sleep(3)
 
         current_url = driver.current_url.lower()
+        host = (urlsplit(current_url).hostname or "").lower()
 
         # If it's a Lever job page (not apply page yet), click Apply
-        if "jobs.lever.co" in current_url and not current_url.endswith("/apply"):
+        if host == "jobs.lever.co" and not urlsplit(current_url).path.rstrip("/").endswith("/apply"):
             try:
                 apply_link = driver.find_element(By.XPATH, "//a[contains(translate(text(), 'APPLY', 'apply'), 'apply')]")
                 apply_link.click()
                 time.sleep(2)
                 current_url = driver.current_url.lower()
+                host = (urlsplit(current_url).hostname or "").lower()
             except Exception:
                 pass
 
-        # Route to appropriate ATS handler
-        if "lever.co" in current_url:
-            apply_lever(driver, profile, resume_abs, auto_submit=auto_submit)
-        elif "greenhouse.io" in current_url:
-            apply_greenhouse(driver, profile, resume_abs, auto_submit=auto_submit)
-        elif "ashbyhq.com" in current_url:
-            apply_ashby(driver, profile, resume_abs, auto_submit=auto_submit)
-        else:
-            apply_generic(driver, profile, resume_abs, auto_submit=auto_submit)
+        def belongs_to(domain):
+            return host == domain or host.endswith("." + domain)
 
-        if not auto_submit:
+        if belongs_to("lever.co"):
+            handler = apply_lever
+        elif belongs_to("greenhouse.io"):
+            handler = apply_greenhouse
+        elif belongs_to("ashbyhq.com"):
+            handler = apply_ashby
+        else:
+            handler = apply_generic
+        supports_auto = handler in (apply_lever, apply_greenhouse)
+        if auto_submit and not supports_auto:
+            if is_headless:
+                print("[!] This ATS does not support headless submission. Use --mode assist.")
+                return False
+            print("[*] Automatic submission unsupported for this ATS; switching to assisted review.")
+        submitted = handler(driver, profile, resume_abs, auto_submit=auto_submit and supports_auto)
+
+        if not submitted and not is_headless:
             print("\n" + "=" * 60)
-            print("🚀 [ASSISTED MODE]: Form auto-filled!")
+            print("[ASSISTED REVIEW]: Check the form and any missing answers.")
             print("   Please review the details in your browser window and click Submit.")
             print("=" * 60)
             input("\n👉 Press [Enter] here once you have submitted or closed the browser...")
-        else:
-            time.sleep(3)
+        return bool(submitted) if auto_submit else True
 
     except Exception as e:
         print(f"[!] Exception during application: {e}")
+        return False
     finally:
         driver.quit()
         print("[✓] Browser closed.")
@@ -363,10 +399,10 @@ def main():
         if not url_input:
             print("[!] No URL provided. Exiting.")
             sys.exit(0)
-        apply_to_job(url_input, mode=args.mode, browser=args.browser)
+        return apply_to_job(url_input, mode=args.mode, browser=args.browser)
     else:
-        apply_to_job(args.url, mode=args.mode, browser=args.browser)
+        return apply_to_job(args.url, mode=args.mode, browser=args.browser)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() else 1)
