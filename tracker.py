@@ -12,9 +12,12 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+import html
+import calendar
+from datetime import date, datetime, timedelta, timezone
 
 # Ensure clean UTF-8 printing on Windows console
-if sys.platform == "win32":
+if sys.platform == "win32" and __name__ == "__main__":
     try:
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -24,6 +27,49 @@ if sys.platform == "win32":
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_jobs.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+POSTING_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+
+
+def posting_window(today=None):
+    """Inclusive dates from two calendar months ago through today in IST."""
+    today = today if today is not None else datetime.now(POSTING_TIMEZONE).date()
+    year, month_index = divmod(today.year * 12 + today.month - 1 - 2, 12)
+    month = month_index + 1
+    cutoff = date(year, month, min(today.day, calendar.monthrange(year, month)[1]))
+    return cutoff, today
+
+
+def parse_posting_date(value):
+    """Read ISO dates/timestamps or Unix seconds/milliseconds as an IST date."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)) or (isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)?", value.strip())):
+            timestamp = float(value)
+            if timestamp >= 100_000_000_000:
+                timestamp /= 1000
+            posted = datetime.fromtimestamp(timestamp, timezone.utc)
+        elif isinstance(value, str):
+            value = value.strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                return date.fromisoformat(value)
+            posted = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if posted.tzinfo is None:
+                posted = posted.replace(tzinfo=timezone.utc)
+        else:
+            return None
+        return posted.astimezone(POSTING_TIMEZONE).date()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def get_posting_date(item):
+    # Only posting/creation dates count. An edit must not make an old job fresh.
+    for key in ("posted_at", "posted_at_timestamp", "date_posted"):
+        posted = parse_posting_date(item.get(key))
+        if posted is not None:
+            return posted
+    return None
 
 # Keywords matching AI, Fullstack, Backend, and SWE internship roles
 ROLE_KEYWORDS = [
@@ -98,97 +144,133 @@ def load_seen():
 
 
 def save_seen(seen_ids):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+    # Replace atomically so interruption cannot leave a truncated database.
+    temp_file = SEEN_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(sorted(list(seen_ids)), f, indent=2)
+    os.replace(temp_file, SEEN_FILE)
 
 
 def get_canonical_keys(company, title, url, job_id=""):
-    """
-    Generates a set of unique fingerprints for foolproof deduplication:
-    1. Clean normalized URL (strips tracking/referral parameters)
-    2. Company + Title normalized signature (catches identical jobs even if URL changes)
-    3. Specific static IDs (e.g. job_uid, ATS UUIDs)
-    """
+    """Identify a requisition by URL/ID, never by its reusable company/title."""
     keys = set()
     if job_id and not str(job_id).startswith("jsearch-LTJ"):
         keys.add(str(job_id).strip())
 
     if url:
-        # Strip all marketing, tracking, and referral query parameters
-        clean_url = re.sub(
-            r"[\?&](?:utm_[^&]+|ref=[^&]+|trk=[^&]+|refId=[^&]+|trackingId=[^&]+|midToken=[^&]+|position=[^&]+|pageNum=[^&]+)",
-            "",
-            str(url)
-        ).rstrip("?&/").lower()
+        parts = urllib.parse.urlsplit(str(url))
+        tracking = {"ref", "trk", "refid", "trackingid", "midtoken", "position", "pagenum"}
+        query = [(key, value) for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                 if not key.lower().startswith("utm_") and key.lower() not in tracking]
+        clean_url = urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                                            parts.path.rstrip("/"),
+                                            urllib.parse.urlencode(sorted(query)), ""))
         if clean_url:
             keys.add(clean_url)
-
-    if company and title:
-        comp_norm = re.sub(r"[^a-z0-9]", "", company.lower())
-        title_norm = re.sub(r"[^a-z0-9]", "", title.lower())
-        if comp_norm and title_norm:
-            keys.add(f"sig:{comp_norm}:{title_norm}")
 
     return keys
 
 
-def is_target_role(title):
+def is_target_role(title, employment_types=None):
     if not title:
         return False
     title_lower = title.lower()
+    if re.search(r"\b(?:senior|sr\.?|staff|principal|lead|manager)\b", title_lower):
+        return False
+    types = employment_types or []
+    if isinstance(types, str):
+        types = [types]
+    internship = re.search(r"\b(?:intern|interns|internship|internships|working student)\b", title_lower)
+    if not internship and not any(str(t).upper() in {"INTERN", "INTERNSHIP"} for t in types):
+        return False
     for neg in NEGATIVE_KEYWORDS:
         if neg in title_lower:
             return False
     return any(p.search(title_lower) for p in COMPILED_PATTERNS)
 
 
-def parse_and_filter_stipend(salary_min, salary_max, period, desc, min_stipend=10000):
-    """
-    Filters out explicit unpaid roles or roles below min_stipend (e.g. 10k INR/month).
-    Keeps competitive / undisclosed roles so top companies are not missed.
-    """
-    # 1. Check structured salary data if present
-    if salary_max or salary_min:
-        val = salary_max or salary_min
-        p_up = (period or "").upper()
-        if p_up == "MONTH":
-            if val < min_stipend:
-                return False, f"< 10k ({val}/mo)"
-            return True, f"INR {val:,.0f}/month"
-        elif p_up == "YEAR":
-            if val < (min_stipend * 12):
-                return False, f"< 120k/yr ({val}/yr)"
-            return True, f"INR {val:,.0f}/year"
-        elif p_up == "HOUR":
-            # Rough monthly equivalent: ~160 hrs * hourly rate
-            if (val * 160) < min_stipend:
-                return False, f"< 10k equivalent"
-            return True, f"INR {val:,.0f}/hour"
-        return True, f"{val}"
+def parse_and_filter_stipend(salary_min, salary_max, period, desc, min_stipend=10000,
+                             currency=None, currency_to_inr=None, default_currency=None):
+    """Compare known pay in INR; retain unconvertible pay with an explicit label.
 
-    # 2. Check description for explicit 'unpaid' indicators
-    desc_lower = desc.lower() if desc else ""
-    unpaid_terms = ["unpaid", "no stipend", "zero stipend", "without stipend", "volunteer intern", "non-paid"]
-    if any(u in desc_lower for u in unpaid_terms):
+    Rates are supplied in config, never guessed. A range uses its lower bound.
+    Bare amounts in descriptions default to monthly; structured pay without a
+    period is retained for review rather than inventing a pay period.
+    """
+    rates = {"INR": 1.0}
+    rates.update({str(k).upper(): float(v) for k, v in (currency_to_inr or {}).items()})
+    text = html.unescape(re.sub(r"<[^>]+>", " ", desc or ""))
+    text = re.sub(r"\s+", " ", text).lower()
+    if re.search(r"\b(?:unpaid|no stipend|zero stipend|without stipend|volunteer intern|non-paid)\b", text):
         return False, "Unpaid"
 
-    # 3. Check description for explicit low stipend amounts (e.g., 5000, 5k, 7000)
-    low_match = re.search(r"(?:stipend|salary)[^\d\n]{1,25}([1-9]\d{2,3}|[1-9]k)\b", desc_lower)
-    if low_match:
-        st_val = low_match.group(1).replace("k", "000")
-        try:
-            if int(st_val) < min_stipend:
-                return False, f"< 10k ({st_val})"
-        except Exception:
-            pass
+    def amount(value):
+        if value is None or value == "":
+            return None
+        match = re.fullmatch(r"(\d[\d,]*(?:\.\d+)?)\s*(k|lakh|lac|lpa)?", str(value).strip().lower())
+        if not match:
+            return None
+        number = float(match.group(1).replace(",", ""))
+        return number * {None: 1, "k": 1000, "lakh": 100000, "lac": 100000, "lpa": 100000}[match.group(2)]
 
-    # 4. Check description for positive stipend mentions (e.g., 15k, 20,000, etc.)
-    high_match = re.search(r"(?:stipend|salary)[^\d\n]{1,25}(\d{2,3}[kK]|\d{5,6})\b", desc_lower)
-    if high_match:
-        found_st = high_match.group(1)
-        return True, f"~{found_st}"
+    def evaluate(value, pay_period, pay_currency):
+        code = (pay_currency or "").upper()
+        label = f"{code or 'Currency unspecified'} {value:,.0f}/{pay_period or 'period unspecified'}"
+        factors = {"MONTH": 1, "YEAR": 1 / 12, "HOUR": 160, "WEEK": 52 / 12, "DAY": 20}
+        if value == 0:
+            return False, "Unpaid"
+        if code not in rates or pay_period not in factors:
+            return True, label + " (INR threshold unverified)"
+        passed = value * factors[pay_period] * rates[code] >= min_stipend
+        return passed, label
 
-    return True, "Competitive / Disclosed on Apply"
+    # Inspect explicit stipend/salary mentions in every source's description.
+    number = r"\d[\d,]*(?:\.\d+)?\s*(?:k\b|lakh\b|lac\b|lpa\b)?"
+    pay_pattern = (r"\b(?:stipend|salary|compensation)\b\s*"
+                   r"(?:(?:range|offered|is|of|up to|from|between)\s*)?[:=–-]?\s*"
+                   r"(?:(?:inr|rs\.?|usd|eur|gbp|₹|\$|€|£)\s*)?"
+                   r"(?P<low>" + number + r")"
+                   r"(?:\s*(?:-|–|to)\s*(?:(?:inr|rs\.?|usd|eur|gbp|₹|\$|€|£)\s*)?"
+                   r"(?P<high>" + number + r"))?")
+    described = None
+    for match in re.finditer(pay_pattern, text):
+        context = match.group(0) + text[match.end():match.end() + 35]
+        code_match = re.search(r"\b(inr|usd|eur|gbp)\b|₹|\brs\.?\b|\$|€|£", context)
+        code = currency or default_currency
+        if code_match:
+            token = code_match.group(0)
+            code = {"₹": "INR", "rs": "INR", "rs.": "INR", "$": "USD", "€": "EUR", "£": "GBP"}.get(token, token.upper())
+        pay_period = "MONTH"
+        if re.search(r"month|/mo\b", context):
+            pay_period = "MONTH"
+        elif re.search(r"year|annual|annum|\blpa\b|/yr", context):
+            pay_period = "YEAR"
+        elif re.search(r"hour|/hr", context):
+            pay_period = "HOUR"
+        elif re.search(r"week|/wk", context):
+            pay_period = "WEEK"
+        elif re.search(r"daily|/day|per day", context):
+            pay_period = "DAY"
+        low = match.group("low").strip()
+        high = match.group("high")
+        # Share a suffix in forms such as 5-10k or 2-3 LPA.
+        if high and not re.search(r"[a-z]", low):
+            suffix = re.search(r"(k|lakh|lac|lpa)\s*$", high)
+            if suffix:
+                low += suffix.group(1)
+        value = amount(low)
+        if value is not None:
+            described = evaluate(value, pay_period, code)
+            if not described[0]:
+                return described
+
+    low, high = amount(salary_min), amount(salary_max)
+    value = low if low is not None else high
+    if value is not None:
+        period_name = (period or "").upper().rstrip("S")
+        period_name = {"MONTHLY": "MONTH", "YEARLY": "YEAR", "ANNUAL": "YEAR", "HOURLY": "HOUR"}.get(period_name, period_name)
+        return evaluate(value, period_name, currency)
+    return described or (True, "Competitive / Disclosed on Apply")
 
 
 def fetch_simplify_listings(repo_name):
@@ -212,7 +294,7 @@ def fetch_arbeitnow_listings():
             jobs = []
             for item in data.get("data", []):
                 title = item.get("title", "")
-                if "intern" in title.lower() or "junior" in title.lower() or "working student" in title.lower():
+                if is_target_role(title):
                     jobs.append({
                         "id": f"arbeitnow-{item.get('slug')}",
                         "company_name": item.get("company_name", "Unknown"),
@@ -222,6 +304,8 @@ def fetch_arbeitnow_listings():
                         "active": True,
                         "source": "Arbeitnow",
                         "stipend": "Disclosed on Apply",
+                        "description": item.get("description", ""),
+                        "posted_at": item.get("created_at"),
                         "is_remote": bool(item.get("remote", False))
                     })
             return jobs
@@ -255,8 +339,8 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
     jobs = []
     print("[*] Querying RapidAPI JSearch (indexes LinkedIn, Indeed, Internshala, Naukri, Glassdoor)...")
 
-    # Rotate through queries (fetching up to 3 queries per run)
-    for q in queries[:3]:
+    # Run every configured domain query, including fullstack and remote.
+    for q in queries:
         encoded_q = urllib.parse.quote(q)
         url = f"https://jsearch.p.rapidapi.com/search-v2?query={encoded_q}&num_pages=1"
         req = urllib.request.Request(url, headers=headers)
@@ -276,7 +360,9 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
                     company = item.get("employer_name", "Unknown")
                     url_link = item.get("job_apply_link") or item.get("job_google_link") or ""
                     city = item.get("job_city") or ""
-                    country = item.get("job_country") or "India"
+                    country = item.get("job_country") or ""
+                    if country.upper() == "IN":
+                        country = "India"
                     location = f"{city}, {country}".strip(", ") if city else country
                     publisher = item.get("job_publisher") or "Web"
                     desc = item.get("job_description", "")
@@ -285,13 +371,8 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
                     sal_max = item.get("job_max_salary")
                     period = item.get("job_salary_period")
 
-                    # Apply stipend filter (>= 10,000 INR/month or competitive)
-                    passed_stipend, stipend_text = parse_and_filter_stipend(sal_min, sal_max, period, desc, min_stipend)
-                    if not passed_stipend:
-                        continue
-
                     job_uid = item.get("job_uid") or ""
-                    stable_id = f"jsearch-{job_uid}" if job_uid else url_link
+                    stable_id = f"jsearch-{job_uid or job_id}" if job_uid or job_id else url_link
 
                     jobs.append({
                         "id": stable_id,
@@ -301,7 +382,14 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
                         "locations": [location],
                         "active": True,
                         "source": f"{publisher} (via JSearch)",
-                        "stipend": stipend_text,
+                        "description": desc,
+                        "salary_min": sal_min,
+                        "salary_max": sal_max,
+                        "salary_period": period,
+                        "salary_currency": item.get("job_salary_currency"),
+                        "employment_types": item.get("job_employment_types", []),
+                        "posted_at": item.get("job_posted_at_datetime_utc"),
+                        "posted_at_timestamp": item.get("job_posted_at_timestamp"),
                         "is_remote": bool(item.get("job_is_remote", False))
                     })
         except urllib.error.HTTPError as e:
@@ -312,34 +400,55 @@ def fetch_jsearch_listings(rapidapi_key, min_stipend=10000):
             print(f"[!] JSearch exception: {e}")
             break
 
-    print(f"[*] JSearch returned {len(jobs)} qualifying postings after stipend check.")
+    print(f"[*] JSearch returned {len(jobs)} postings for filtering.")
     return jobs
 
 
-def send_discord_webhook(webhook_url, embeds):
-    """Sends embeds to a Discord webhook in chunks of 10."""
+def send_discord_webhook(webhook_url, embeds, on_delivered=None):
+    """Return delivered embed indexes; checkpoint each acknowledged message."""
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "InternshipBot/1.0"
     }
 
-    # Discord allows max 10 embeds per message
-    for i in range(0, len(embeds), 10):
-        chunk = embeds[i:i + 10]
+    # Discord also limits the combined embed text to 6,000 characters.
+    batches = []
+    chunk, indexes, chars = [], [], 0
+    for index, embed in enumerate(embeds):
+        size = len(embed.get("title", "")) + len(embed.get("description", ""))
+        size += len(embed.get("footer", {}).get("text", ""))
+        size += sum(len(f["name"]) + len(f["value"]) for f in embed.get("fields", []))
+        if chunk and (len(chunk) == 10 or chars + size > 6000):
+            batches.append((chunk, indexes))
+            chunk, indexes, chars = [], [], 0
+        chunk.append(embed)
+        indexes.append(index)
+        chars += size
+    if chunk:
+        batches.append((chunk, indexes))
+    delivered = set()
+    for i, (chunk, indexes) in enumerate(batches):
         payload = {
             "content": "🚀 **New Internship Openings Found!**" if i == 0 else "",
             "embeds": chunk
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(webhook_url, data=data, headers=headers)
+        success = False
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                pass
-            time.sleep(1)  # avoid rate limiting
+                success = 200 <= resp.status < 300
         except urllib.error.HTTPError as e:
             print(f"[!] Discord Webhook HTTP Error: {e.code} - {e.read().decode('utf-8', errors='ignore')}")
         except Exception as e:
             print(f"[!] Error sending to Discord: {e}")
+        if success:
+            delivered.update(indexes)
+            # Keep state-write errors visible; never treat them as delivery errors.
+            if on_delivered:
+                on_delivered(indexes)
+            time.sleep(1)
+    return delivered
 
 
 def main():
@@ -348,12 +457,15 @@ def main():
     min_stipend = 10000
     max_alerts = 30
     min_indian_alerts = 15
+    currency_to_inr = {"INR": 1.0}
 
     # Check config.json if available
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+                if not isinstance(cfg, dict):
+                    raise ValueError("config.json must contain an object")
                 if not webhook_url and "discord_webhook_url" in cfg:
                     webhook_url = cfg["discord_webhook_url"]
                 if not rapidapi_key and "rapidapi_key" in cfg:
@@ -364,12 +476,20 @@ def main():
                     max_alerts = int(cfg["max_alerts_per_run"])
                 if "min_indian_alerts" in cfg:
                     min_indian_alerts = int(cfg["min_indian_alerts"])
-        except Exception:
-            pass
+                currency_to_inr.update({str(k).upper(): float(v) for k, v in cfg.get("currency_to_inr", {}).items()})
+        except (ValueError, TypeError, OSError) as e:
+            print(f"[!] Invalid configuration: {e}")
+            return False
+    if min_stipend < 0 or max_alerts < 1 or min_indian_alerts < 0 or any(v <= 0 for v in currency_to_inr.values()):
+        print("[!] Invalid alert limits or currency conversion rates.")
+        return False
+    min_indian_alerts = min(min_indian_alerts, max_alerts)
 
     seen_ids = load_seen()
+    cutoff, today = posting_window()
     print(f"[*] Loaded {len(seen_ids)} previously seen jobs.")
     print(f"[*] Configuration: Min Stipend = INR {min_stipend:,} | Total Daily Alerts = {max_alerts} (Min {min_indian_alerts} for India)")
+    print(f"[*] Posting dates must be {cutoff.isoformat()} through {today.isoformat()} (IST, inclusive).")
 
     print("[*] Fetching listings from SimplifyJobs (Summer 2025 / Summer 2026)...")
     listings_2025 = fetch_simplify_listings("Summer2025-Internships")
@@ -382,6 +502,7 @@ def main():
 
     new_matches = []
     current_run_keys = set()
+    date_rejections = 0
     
     for item in all_raw:
         job_id = str(item.get("id") or item.get("url") or "")
@@ -389,7 +510,7 @@ def main():
         title = item.get("title", "")
         url = item.get("url", "")
 
-        # Generate unique canonical keys (clean URL, company+title signature, static ID)
+        # Legacy sig: keys in seen_jobs.json are intentionally no longer consulted.
         item_keys = get_canonical_keys(company, title, url, job_id)
         if not item_keys:
             continue
@@ -406,7 +527,12 @@ def main():
         if item.get("active") is False:
             continue
 
-        if not is_target_role(title):
+        posted_date = get_posting_date(item)
+        if posted_date is None or not cutoff <= posted_date <= today:
+            date_rejections += 1
+            continue
+
+        if not is_target_role(title, item.get("employment_types")):
             continue
 
         locs = item.get("locations", [])
@@ -419,7 +545,16 @@ def main():
 
         terms = item.get("terms", [])
         term_str = ", ".join(terms) if isinstance(terms, list) else str(terms or "")
-        stipend_str = item.get("stipend", "Disclosed on Apply")
+        description = " ".join(str(item.get(key) or "") for key in ("description", "job_description"))
+        if item.get("stipend") is not None:
+            description += " Stipend: " + str(item["stipend"])
+        passed_stipend, stipend_str = parse_and_filter_stipend(
+            item.get("salary_min"), item.get("salary_max"), item.get("salary_period"),
+            description, min_stipend, currency=item.get("salary_currency"),
+            currency_to_inr=currency_to_inr,
+            default_currency="INR" if INDIA_REGEX.search(loc_str) else None)
+        if not passed_stipend:
+            continue
 
         is_india = bool(INDIA_REGEX.search(loc_str))
 
@@ -435,15 +570,17 @@ def main():
             "term": term_str,
             "source": item.get("source", "Simplify"),
             "stipend": stipend_str,
+            "posted_date": posted_date.isoformat(),
             "is_india": is_india,
             "keys": item_keys
         })
 
+    print(f"[*] Skipped {date_rejections} listings with old, missing, invalid, or future posting dates.")
     print(f"[*] Found {len(new_matches)} new matching internship openings.")
 
     if not new_matches:
         print("[OK] No new postings since last check. All caught up!")
-        return
+        return True
 
     # Partition matches into India and Remote
     india_matches = [m for m in new_matches if m["is_india"]]
@@ -494,11 +631,14 @@ def main():
             {"name": "Company", "value": match["company"], "inline": True},
             {"name": "Location", "value": match["location"] or "Remote/Various", "inline": True},
             {"name": "Stipend", "value": match["stipend"], "inline": True},
+            {"name": "Posted (IST)", "value": match["posted_date"], "inline": True},
         ]
         if match["term"]:
             fields.append({"name": "Term", "value": match["term"], "inline": True})
         if match["source"]:
             fields.append({"name": "Source", "value": match["source"], "inline": True})
+        for field in fields:
+            field["value"] = str(field["value"])[:1024] or "Not specified"
 
         embed = {
             "title": match["title"][:256],
@@ -512,20 +652,23 @@ def main():
 
     if webhook_url and webhook_url.strip() and "discord.com/api/webhooks" in webhook_url:
         print(f"[*] Dispatching {len(embeds)} embeds to Discord...")
-        send_discord_webhook(webhook_url, embeds)
-        print("[OK] Discord notifications sent successfully!")
+        def checkpoint(indexes):
+            for index in indexes:
+                seen_ids.update(alerts_to_send[index]["keys"])
+            save_seen(seen_ids)
+
+        delivered = send_discord_webhook(webhook_url, embeds, on_delivered=checkpoint)
+        print(f"[*] Delivered {len(delivered)}/{len(embeds)} alerts. Undelivered jobs remain eligible for retry.")
+        return len(delivered) == len(embeds)
     else:
         print("[!] No Discord Webhook configured yet (or URL is placeholder).")
         print("[*] Displaying top 5 new matches in console:")
         for m in alerts_to_send[:5]:
             print(f"  - [{m['company']}] {m['title']} ({m['location']}) - Stipend: {m['stipend']} -> {m['url']}")
 
-    # Mark sent alerts as seen using all canonical fingerprints (URL, signature, ID)
-    for m in alerts_to_send:
-        seen_ids.update(m.get("keys", [m["id"]]))
-    save_seen(seen_ids)
-    print(f"[*] Updated seen database. Total tracked fingerprints: {len(seen_ids)}")
+    print("[*] Preview only; no jobs were marked as seen.")
+    return True
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() else 1)

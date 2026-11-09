@@ -3,5 +3,8 @@
   "rapidapi_key": "YOUR_RAPIDAPI_KEY_HERE",
   "min_stipend": 10000,
   "max_alerts_per_run": 30,
-  "min_indian_alerts": 15
+  "min_indian_alerts": 15,
+  "currency_to_inr": {
+    "INR": 1
+  }
 }
