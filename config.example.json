@@ -4,6 +4,7 @@
   "min_stipend": 10000,
   "max_alerts_per_run": 30,
   "min_indian_alerts": 15,
+  "max_posting_age_months": 6,
   "currency_to_inr": {
     "INR": 1
   }

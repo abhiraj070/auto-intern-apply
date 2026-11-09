@@ -28,12 +28,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_jobs.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 POSTING_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+DEFAULT_POSTING_AGE_MONTHS = 6
 
 
-def posting_window(today=None):
-    """Inclusive dates from two calendar months ago through today in IST."""
+def posting_window(today=None, max_age_months=DEFAULT_POSTING_AGE_MONTHS):
+    """Inclusive posting dates over the configured calendar-month window in IST."""
+    if isinstance(max_age_months, bool) or not isinstance(max_age_months, int) or not 1 <= max_age_months <= 120:
+        raise ValueError("max_posting_age_months must be an integer between 1 and 120")
     today = today if today is not None else datetime.now(POSTING_TIMEZONE).date()
-    year, month_index = divmod(today.year * 12 + today.month - 1 - 2, 12)
+    year, month_index = divmod(today.year * 12 + today.month - 1 - max_age_months, 12)
     month = month_index + 1
     cutoff = date(year, month, min(today.day, calendar.monthrange(year, month)[1]))
     return cutoff, today
@@ -458,6 +461,7 @@ def main():
     max_alerts = 30
     min_indian_alerts = 15
     currency_to_inr = {"INR": 1.0}
+    max_posting_age_months = DEFAULT_POSTING_AGE_MONTHS
 
     # Check config.json if available
     if os.path.exists(CONFIG_FILE):
@@ -476,6 +480,7 @@ def main():
                     max_alerts = int(cfg["max_alerts_per_run"])
                 if "min_indian_alerts" in cfg:
                     min_indian_alerts = int(cfg["min_indian_alerts"])
+                max_posting_age_months = cfg.get("max_posting_age_months", DEFAULT_POSTING_AGE_MONTHS)
                 currency_to_inr.update({str(k).upper(): float(v) for k, v in cfg.get("currency_to_inr", {}).items()})
         except (ValueError, TypeError, OSError) as e:
             print(f"[!] Invalid configuration: {e}")
@@ -485,11 +490,15 @@ def main():
         return False
     min_indian_alerts = min(min_indian_alerts, max_alerts)
 
+    try:
+        cutoff, today = posting_window(max_age_months=max_posting_age_months)
+    except ValueError as e:
+        print(f"[!] Invalid configuration: {e}")
+        return False
     seen_ids = load_seen()
-    cutoff, today = posting_window()
     print(f"[*] Loaded {len(seen_ids)} previously seen jobs.")
     print(f"[*] Configuration: Min Stipend = INR {min_stipend:,} | Total Daily Alerts = {max_alerts} (Min {min_indian_alerts} for India)")
-    print(f"[*] Posting dates must be {cutoff.isoformat()} through {today.isoformat()} (IST, inclusive).")
+    print(f"[*] Posting dates must be {cutoff.isoformat()} through {today.isoformat()} (last {max_posting_age_months} calendar months, IST, inclusive).")
 
     print("[*] Fetching listings from SimplifyJobs (Summer 2025 / Summer 2026)...")
     listings_2025 = fetch_simplify_listings("Summer2025-Internships")

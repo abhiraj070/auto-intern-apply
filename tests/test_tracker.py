@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 import tracker
 
@@ -117,11 +117,15 @@ class RoleAndDedupTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
-    def run_tracker(self, simplify=None, arbeitnow=None, jsearch=None, webhook=True, seen=None, effects=None):
+    def run_tracker(self, simplify=None, arbeitnow=None, jsearch=None, webhook=True, seen=None, effects=None, config=None):
         snapshots = []
+        real_posting_window = tracker.posting_window
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(tracker, "posting_window", return_value=(date(2026, 9, 9), date(2026, 11, 9))))
-            stack.enter_context(patch.object(tracker.os.path, "exists", return_value=False))
+            stack.enter_context(patch.object(tracker, "posting_window", side_effect=lambda **kwargs:
+                real_posting_window(today=date(2026, 11, 9), **kwargs)))
+            stack.enter_context(patch.object(tracker.os.path, "exists", return_value=config is not None))
+            if config is not None:
+                stack.enter_context(patch("builtins.open", mock_open(read_data=json.dumps(config))))
             stack.enter_context(patch.dict(tracker.os.environ, {
                 "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/mock" if webhook else "",
                 "RAPIDAPI_KEY": ""}))
@@ -152,7 +156,8 @@ class PipelineTests(unittest.TestCase):
             arbeitnow=[job(3, date_posted=None, posted_at="2026-08-01"),
                        job(4, date_posted=None, posted_at="2026-11-09")],
             jsearch=[job(5, date_posted=None, posted_at="2026-09-08T00:00:00Z"),
-                     job(6, date_posted=None, posted_at="2026-10-01T00:00:00Z")])
+                     job(6, date_posted=None, posted_at="2026-10-01T00:00:00Z")],
+            config={"max_posting_age_months": 2})
         self.assertTrue(result)
         self.assertEqual(len(payloads[0]["embeds"]), 3)
         self.assertTrue({"2", "4", "6"} <= snapshots[-1])
@@ -172,10 +177,36 @@ class PipelineTests(unittest.TestCase):
 
     def test_old_copy_does_not_suppress_a_recent_copy(self):
         result, snapshots, payloads, _ = self.run_tracker(
-            simplify=[job(1, date_posted="2026-07-01")], jsearch=[job(1)])
+            simplify=[job(1, date_posted="2026-04-01")], jsearch=[job(1)])
         self.assertTrue(result)
         self.assertEqual(len(payloads[0]["embeds"]), 1)
         self.assertIn("1", snapshots[-1])
+
+    def test_default_six_month_window_accepts_older_jobs_at_cutoff(self):
+        result, snapshots, payloads, output = self.run_tracker(simplify=[
+            job(1, date_posted="2026-05-08"), job(2, date_posted="2026-05-09"),
+            job(3, date_posted="2026-07-01")])
+        self.assertTrue(result)
+        self.assertEqual(len(payloads[0]["embeds"]), 2)
+        self.assertTrue({"2", "3"} <= snapshots[-1])
+        self.assertNotIn("1", snapshots[-1])
+        self.assertIn("last 6 calendar months", output)
+
+    def test_existing_config_without_age_setting_uses_six_months(self):
+        result, _, payloads, _ = self.run_tracker(
+            simplify=[job(1, date_posted="2026-07-01")], config={"max_alerts_per_run": 30})
+        self.assertTrue(result)
+        self.assertEqual(len(payloads[0]["embeds"]), 1)
+
+    def test_invalid_age_config_fails_without_sending_or_saving(self):
+        for age in [0, -1, 121, True, "six", 2.5]:
+            with self.subTest(age=age):
+                result, snapshots, payloads, output = self.run_tracker(
+                    simplify=[job(1)], config={"max_posting_age_months": age})
+                self.assertFalse(result)
+                self.assertEqual(snapshots, [])
+                self.assertEqual(payloads, [])
+                self.assertIn("Invalid configuration", output)
 
     def test_failed_delivery_stays_unseen_and_returns_failure(self):
         result, snapshots, _, output = self.run_tracker(simplify=[job(1)], effects=OSError("offline"))
@@ -275,12 +306,17 @@ class PostingDateTests(unittest.TestCase):
         ]
         for today, cutoff in cases:
             with self.subTest(today=today):
-                self.assertEqual(tracker.posting_window(today), (cutoff, today))
+                self.assertEqual(tracker.posting_window(today, max_age_months=2), (cutoff, today))
+
+    def test_default_six_month_cutoff_handles_year_boundary_and_leap_day(self):
+        self.assertEqual(tracker.posting_window(date(2026, 11, 9)), (date(2026, 5, 9), date(2026, 11, 9)))
+        self.assertEqual(tracker.posting_window(date(2026, 1, 31)), (date(2025, 7, 31), date(2026, 1, 31)))
+        self.assertEqual(tracker.posting_window(date(2024, 8, 31)), (date(2024, 2, 29), date(2024, 8, 31)))
 
     def test_runtime_clock_uses_ist(self):
         with patch.object(tracker, "datetime") as clock:
             clock.now.return_value.date.return_value = date(2026, 11, 9)
-            self.assertEqual(tracker.posting_window(), (date(2026, 9, 9), date(2026, 11, 9)))
+            self.assertEqual(tracker.posting_window(), (date(2026, 5, 9), date(2026, 11, 9)))
             clock.now.assert_called_once_with(tracker.POSTING_TIMEZONE)
 
     def test_iso_timestamps_are_converted_to_ist(self):

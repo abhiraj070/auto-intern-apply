@@ -25,7 +25,7 @@ An automated multi-platform tech internship tracker and auto-application assista
 * **Balanced Quota (30 Total / 15 India)**: Dispatches 30 curated daily openings with a dedicated priority quota of at least 15 physical Indian openings, complemented with worldwide Remote openings.
 * **Deduplication Engine**: Uses requisition IDs and normalized URLs in `seen_jobs.json`. Separate vacancies with the same company/title remain eligible. State is saved after each confirmed Discord message; failed deliveries and console previews remain eligible for the next run. A network timeout after Discord accepts a message can still cause a duplicate on retry.
 * **Internship Filter**: Requires an internship/working-student title or structured internship employment type, and excludes senior roles. JSearch runs all five domain queries on each run.
-* **Posting Age Filter**: Only includes jobs posted within the last two calendar months, including the cutoff day, based on IST. For example, a November 9 run accepts September 9 through November 9. Missing, invalid, and future dates are skipped. The original posting date is used; editing a listing does not refresh its age. Discord cards show the posting date.
+* **Posting Age Filter**: Includes jobs posted within the last six calendar months by default, including the cutoff day, based on IST. For example, a November 9 run accepts May 9 through November 9. Set `max_posting_age_months` in `config.json` to adjust the window (an integer from 1 to 120). Existing configurations without this setting use six months automatically. Missing, invalid, and future dates are skipped. The original posting date is used; editing a listing does not refresh its age. Discord cards show the posting date.
 
 ---
 
@@ -44,6 +44,7 @@ Edit `config.json` with your credentials:
   "min_stipend": 10000,
   "max_alerts_per_run": 30,
   "min_indian_alerts": 15,
+  "max_posting_age_months": 6,
   "currency_to_inr": {"INR": 1}
 }
 ```
